@@ -5,6 +5,8 @@ import { useEffect, useState } from "react";
 import { Animated, Easing, StyleSheet, Text, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { COLORS } from "../constants/theme";
+import { NotificationService } from "../hooks/notificationService";
+import { TaskService } from "../hooks/taskService";
 import { useSession } from "../hooks/useSession";
 
 SplashScreen.preventAutoHideAsync();
@@ -87,6 +89,28 @@ export default function RootLayout() {
   const segments = useSegments();
   const router = useRouter();
   const [showSplash, setShowSplash] = useState(true);
+
+  // Initialize notification services
+  useEffect(() => {
+    const initializeNotifications = async () => {
+      try {
+        console.log("Initializing notification services...");
+        await NotificationService.initialize();
+        await TaskService.registerBackgroundTask();
+        await TaskService.checkStatus();
+        console.log("Notification services initialized successfully");
+      } catch (error) {
+        console.error("Error initializing notifications:", error);
+      }
+    };
+
+    initializeNotifications();
+
+    // Cleanup on unmount
+    return () => {
+      NotificationService.cleanup();
+    };
+  }, []);
 
   useEffect(() => {
     if (loading) return;

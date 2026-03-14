@@ -33,7 +33,8 @@
           "color": "#FF6B9D"
         }
       ],
-      "expo-web-browser"
+      "expo-web-browser",
+      "./fix-manifest"
     ],
     "extra": {
       "router": {},

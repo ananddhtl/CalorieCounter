@@ -22,8 +22,9 @@ import {
   ReminderType,
   ReminderTypeOption,
 } from "../../constants/types";
+import { NotificationService } from "../../hooks/notificationService";
+import { TaskService } from "../../hooks/taskService";
 import { supabase } from "../../hooks/useSupabase";
-
 const TODAY = new Date().toISOString().split("T")[0];
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -45,6 +46,7 @@ export default function RemindersScreen(): React.JSX.Element {
   const [reminderLogs, setReminderLogs] = useState<ReminderLog[]>([]);
   const [modalVisible, setModalVisible] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(false);
+  const [notificationEnabled, setNotificationEnabled] = useState<boolean>(true);
 
   const [type, setType] = useState<ReminderType>("medicine");
   const [title, setTitle] = useState("");
@@ -53,6 +55,25 @@ export default function RemindersScreen(): React.JSX.Element {
   const [color, setColor] = useState(COLORS.primary);
   const [time, setTime] = useState("08:00");
   const [days, setDays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
+
+  // Initialize notification service
+  useEffect(() => {
+    const initializeNotifications = async () => {
+      try {
+        await NotificationService.initialize();
+        await TaskService.registerBackgroundTask();
+        console.log("Notifications initialized in RemindersScreen");
+      } catch (error) {
+        console.error("Error initializing notifications:", error);
+      }
+    };
+
+    initializeNotifications();
+
+    return () => {
+      NotificationService.cleanup();
+    };
+  }, []);
 
   const fetchData = useCallback(async (): Promise<void> => {
     const {
@@ -89,6 +110,39 @@ export default function RemindersScreen(): React.JSX.Element {
     setDays([1, 2, 3, 4, 5, 6, 7]);
   };
 
+  const scheduleReminderNotification = (reminder: Reminder): void => {
+    try {
+      const now = new Date();
+      const [hours, minutes] = reminder.reminder_time.split(":").map(Number);
+
+      const reminderDate = new Date();
+      reminderDate.setHours(hours, minutes, 0);
+
+      // If time has passed today, schedule for tomorrow
+      if (reminderDate < now) {
+        reminderDate.setDate(reminderDate.getDate() + 1);
+      }
+
+      const delayMs = reminderDate.getTime() - now.getTime();
+      const delaySecs = Math.ceil(delayMs / 1000);
+
+      if (delaySecs > 0) {
+        NotificationService.scheduleLocalNotification(
+          reminder.title,
+          reminder.dosage || `Time to take your ${reminder.title}`,
+          delaySecs,
+          reminder.id,
+        );
+
+        console.log(
+          `Notification scheduled for ${reminder.title} in ${delaySecs} seconds`,
+        );
+      }
+    } catch (error) {
+      console.error("Error scheduling notification:", error);
+    }
+  };
+
   const saveReminder = async (): Promise<void> => {
     if (!title || !time) {
       Alert.alert("Oops!", "Enter a title and time");
@@ -120,6 +174,11 @@ export default function RemindersScreen(): React.JSX.Element {
         .select();
 
       if (!error && reminderData) {
+        // Schedule notification for today if reminder is due today
+        if (notificationEnabled) {
+          scheduleReminderNotification(reminderData[0]);
+        }
+
         await fetchData();
         setModalVisible(false);
         resetForm();
@@ -142,6 +201,13 @@ export default function RemindersScreen(): React.JSX.Element {
         .from("reminders")
         .update({ is_active: newState })
         .eq("id", rem.id);
+
+      if (!newState) {
+        // Cancel notifications if disabling
+      } else if (notificationEnabled) {
+        // Re-schedule if enabling and notifications are on
+        scheduleReminderNotification(rem);
+      }
 
       fetchData();
     } catch (error) {
@@ -217,11 +283,6 @@ export default function RemindersScreen(): React.JSX.Element {
     reminderLogs.some((l) => l.reminder_id === r.id && l.status === "taken"),
   ).length;
 
-  const getTypeIcon = (type: string): keyof typeof Ionicons.glyphMap => {
-    const found = REMINDER_TYPES.find((t) => t.key === type);
-    return (found?.icon as keyof typeof Ionicons.glyphMap) || "help-circle";
-  };
-
   return (
     <LinearGradient colors={["#FFF0F5", "#FFF8FB"]} style={styles.container}>
       <SafeAreaView style={styles.safe}>
@@ -255,6 +316,32 @@ export default function RemindersScreen(): React.JSX.Element {
                 <Text style={styles.addMainText}>New</Text>
               </LinearGradient>
             </TouchableOpacity>
+          </View>
+
+          <View style={styles.notificationToggle}>
+            <View style={styles.notificationToggleLeft}>
+              <Ionicons
+                name={
+                  notificationEnabled ? "notifications" : "notifications-off"
+                }
+                size={18}
+                color={COLORS.primary}
+              />
+              <Text style={styles.notificationToggleText}>
+                {notificationEnabled ? "Notifications On" : "Notifications Off"}
+              </Text>
+            </View>
+            <Switch
+              value={notificationEnabled}
+              onValueChange={setNotificationEnabled}
+              trackColor={{
+                false: COLORS.surface,
+                true: COLORS.primaryLight,
+              }}
+              thumbColor={
+                notificationEnabled ? COLORS.primary : COLORS.textLight
+              }
+            />
           </View>
 
           <View style={styles.statsRow}>
@@ -632,6 +719,27 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   addMainText: { color: COLORS.white, fontWeight: "700", fontSize: 14 },
+  notificationToggle: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: COLORS.white,
+    borderRadius: RADIUS.lg,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginBottom: 16,
+    ...SHADOW.card,
+  },
+  notificationToggleLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  notificationToggleText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: COLORS.textDark,
+  },
   statsRow: { flexDirection: "row", gap: 10, marginBottom: 16 },
   statCard: {
     flex: 1,

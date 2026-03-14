@@ -24,7 +24,11 @@ import { supabase } from "../../hooks/useSupabase";
 
 const TODAY = new Date().toISOString().split("T")[0];
 
-const GEMINI_API_KEY = "AIzaSyBZyC9GpWvICN-v85uE49MJswF3YtMb8lo";
+// ── NVIDIA API config ──────────────────────────────────────────────────────────
+const NVIDIA_API_KEY =
+  "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";
+const NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
+
 const NUTRITIONIX_APP_ID = "YOUR_APP_ID";
 const NUTRITIONIX_APP_KEY = "YOUR_APP_KEY";
 
@@ -46,7 +50,7 @@ interface AIAnalysisResult {
   notes: string;
 }
 
-interface GeminiAnalysisResult {
+interface NvidiaAnalysisResult {
   food_name: string;
   estimated_calories: number;
   protein_g: number;
@@ -151,6 +155,10 @@ const QUICK_FOODS: QuickFood[] = [
 
 type TabType = "quick" | "custom" | "image";
 
+// Module-level store for picked image base64 (avoids large data in React state)
+let _pickedBase64 = "";
+let _pickedMime = "image/jpeg";
+
 export default function CaloriesScreen(): React.JSX.Element {
   const [logs, setLogs] = useState<FoodLog[]>([]);
   const [calorieGoal, setCalorieGoal] = useState<number>(2000);
@@ -162,21 +170,22 @@ export default function CaloriesScreen(): React.JSX.Element {
   const [search, setSearch] = useState<string>("");
   const [tab, setTab] = useState<TabType>("quick");
 
-  // Nutritionix search states
+  // Nutritionix
   const [foodQuery, setFoodQuery] = useState<string>("");
   const [analyzing, setAnalyzing] = useState<boolean>(false);
   const [aiResult, setAiResult] = useState<AIAnalysisResult | null>(null);
   const [aiError, setAiError] = useState<string | null>(null);
 
-  // Gemini image analysis states
+  // NVIDIA image analysis
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [analyzeImage, setAnalyzeImage] = useState<boolean>(false);
-  const [geminiResult, setGeminiResult] = useState<GeminiAnalysisResult | null>(
+  const [nvidiaResult, setNvidiaResult] = useState<NvidiaAnalysisResult | null>(
     null,
   );
-  const [geminiError, setGeminiError] = useState<string | null>(null);
+  const [nvidiaError, setNvidiaError] = useState<string | null>(null);
+  const [streamingText, setStreamingText] = useState<string>("");
 
-  // Custom food form states
+  // Custom form
   const [foodName, setFoodName] = useState("");
   const [calories, setCalories] = useState("");
   const [protein, setProtein] = useState("");
@@ -194,7 +203,6 @@ export default function CaloriesScreen(): React.JSX.Element {
         setLoading(false);
         return;
       }
-
       const [{ data: logsData }, { data: prof }] = await Promise.all([
         supabase
           .from("food_logs")
@@ -208,11 +216,9 @@ export default function CaloriesScreen(): React.JSX.Element {
           .eq("id", user.id)
           .single(),
       ]);
-
       setLogs((logsData as FoodLog[]) || []);
       if (prof?.daily_calorie_goal) setCalorieGoal(prof.daily_calorie_goal);
     } catch (error) {
-      console.error("Error fetching logs:", error);
       Alert.alert("Error", "Failed to load your food logs");
     } finally {
       setLoading(false);
@@ -230,7 +236,6 @@ export default function CaloriesScreen(): React.JSX.Element {
     setTab("quick");
     resetForm();
   };
-
   const openAiModal = (meal: MealType): void => {
     setActiveMeal(meal);
     setAiModalVisible(true);
@@ -238,7 +243,6 @@ export default function CaloriesScreen(): React.JSX.Element {
     setAiResult(null);
     setAiError(null);
   };
-
   const resetForm = (): void => {
     setFoodName("");
     setCalories("");
@@ -247,245 +251,254 @@ export default function CaloriesScreen(): React.JSX.Element {
     setFat("");
     setServing("1 serving");
   };
+  const closeImageModal = (): void => {
+    setModalVisible(false);
+    setSelectedImage(null);
+    setNvidiaResult(null);
+    setNvidiaError(null);
+    setStreamingText("");
+    setTab("quick");
+    _pickedBase64 = "";
+    _pickedMime = "image/jpeg";
+  };
 
-  // ─── Pick image from library ─────────────────────────────────────────
+  // ─── Image pickers (base64: true) ────────────────────────────────────
   const pickImage = async (): Promise<void> => {
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsEditing: true,
         aspect: [4, 3],
-        quality: 0.8,
-        base64: false,
+        quality: 0.7,
+        base64: true,
       });
-
-      if (!result.canceled && result.assets[0].uri) {
+      if (!result.canceled && result.assets[0]) {
         setSelectedImage(result.assets[0].uri);
+        _pickedBase64 = result.assets[0].base64 ?? "";
+        _pickedMime = result.assets[0].mimeType ?? "image/jpeg";
       }
-    } catch (err) {
-      console.error("Pick image error:", err);
+    } catch {
       Alert.alert("Error", "Failed to pick image");
     }
   };
 
-  // ─── Take photo from camera ─────────────────────────────────────────
   const takePhoto = async (): Promise<void> => {
     try {
       const result = await ImagePicker.launchCameraAsync({
         allowsEditing: true,
         aspect: [4, 3],
-        quality: 0.8,
-        base64: false,
+        quality: 0.7,
+        base64: true,
       });
-
-      if (!result.canceled && result.assets[0].uri) {
+      if (!result.canceled && result.assets[0]) {
         setSelectedImage(result.assets[0].uri);
+        _pickedBase64 = result.assets[0].base64 ?? "";
+        _pickedMime = result.assets[0].mimeType ?? "image/jpeg";
       }
-    } catch (err) {
-      console.error("Take photo error:", err);
+    } catch {
       Alert.alert("Error", "Failed to take photo");
     }
   };
 
-  // ─── Analyze image with Gemini AI ───────────────────────────────────
-  const analyzeFoodImage = async (): Promise<void> => {
+  // ─── NVIDIA Mistral image analysis via XMLHttpRequest (RN-compatible) ───────
+  const analyzeFoodImage = (): void => {
     if (!selectedImage) {
-      setGeminiError("Please select an image first");
+      setNvidiaError("Please select an image first");
       return;
     }
-
-    if (!GEMINI_API_KEY || GEMINI_API_KEY.includes("YOUR_")) {
-      setGeminiError(
-        "Gemini API key not configured. Please add your API key to the code.",
-      );
+    if (!_pickedBase64) {
+      setNvidiaError("Image data unavailable — please re-select the photo.");
       return;
     }
 
     setAnalyzeImage(true);
-    setGeminiError(null);
+    setNvidiaError(null);
+    setStreamingText("");
+    setNvidiaResult(null);
 
-    try {
-      // Convert image URI to base64
-      const response = await fetch(selectedImage);
-      const blob = await response.blob();
-      const reader = new FileReader();
+    const imageDataUrl = `data:${_pickedMime};base64,${_pickedBase64}`;
 
-      reader.onload = async () => {
+    const systemPrompt =
+      "You are a professional nutrition analyst. " +
+      "Respond ONLY with valid JSON — no markdown fences, no explanation.";
+
+    const userPrompt =
+      "Analyze this food image and return ONLY this JSON:\n" +
+      "{\n" +
+      '  "food_name": "name of the dish",\n' +
+      '  "estimated_calories": <number>,\n' +
+      '  "protein_g": <number>,\n' +
+      '  "carbs_g": <number>,\n' +
+      '  "fat_g": <number>,\n' +
+      '  "confidence_level": "high" | "medium" | "low",\n' +
+      '  "items": [{"name": "<item>", "estimated_calories": <number>}]\n' +
+      "}\n" +
+      'Be specific about visible portion sizes. Set confidence_level to "low" if unsure.';
+
+    const body = JSON.stringify({
+      model: "mistralai/mistral-medium-3-instruct",
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userPrompt },
+            { type: "image_url", image_url: { url: imageDataUrl } },
+          ],
+        },
+      ],
+      max_tokens: 512,
+      temperature: 0.2,
+      top_p: 1.0,
+      frequency_penalty: 0.0,
+      presence_penalty: 0.0,
+      stream: true,
+    });
+
+    const xhr = new XMLHttpRequest();
+    let accumulated = ""; // SSE text buffer (may span multiple onprogress chunks)
+    let fullContent = ""; // assembled model output
+
+    xhr.open("POST", NVIDIA_API_URL, true);
+    xhr.setRequestHeader("Authorization", `Bearer ${NVIDIA_API_KEY}`);
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.setRequestHeader("Accept", "text/event-stream");
+
+    // Called repeatedly as chunks arrive
+    xhr.onprogress = () => {
+      // responseText grows with each chunk; process only the new tail
+      const newChunk = xhr.responseText.slice(accumulated.length);
+      accumulated = xhr.responseText;
+
+      for (const line of newChunk.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (data === "[DONE]") continue;
         try {
-          const base64String = (reader.result as string).split(",")[1];
-
-          const geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                contents: [
-                  {
-                    parts: [
-                      {
-                        text: `You are a nutrition analyst. Analyze this food image and provide ONLY a valid JSON response with this exact structure (no markdown, no explanation, just JSON):
-{
-  "food_name": "name of the dish",
-  "estimated_calories": number (estimate total calories for the visible portion),
-  "protein_g": number (grams),
-  "carbs_g": number (grams),
-  "fat_g": number (grams),
-  "confidence_level": "high" or "medium" or "low",
-  "items": [
-    {"name": "item name", "estimated_calories": number},
-    {"name": "item name", "estimated_calories": number}
-  ]
-}
-
-Be specific about portion sizes. If you cannot identify the food, set confidence_level to "low" and provide your best estimate.`,
-                      },
-                      {
-                        inlineData: {
-                          mimeType: "image/jpeg",
-                          data: base64String,
-                        },
-                      },
-                    ],
-                  },
-                ],
-              }),
-            },
-          );
-
-          const data = await geminiResponse.json();
-
-          if (!geminiResponse.ok) {
-            throw new Error(
-              data.error?.message || "Failed to analyze image with Gemini",
-            );
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            fullContent += delta;
+            setStreamingText(fullContent);
           }
-
-          // Extract text from response
-          const textContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (!textContent) {
-            throw new Error("No response from Gemini API");
-          }
-
-          // Parse JSON from response (strip markdown if present)
-          let jsonString = textContent.trim();
-          if (jsonString.startsWith("```json")) {
-            jsonString = jsonString
-              .replace(/^```json\n?/, "")
-              .replace(/\n?```$/, "");
-          } else if (jsonString.startsWith("```")) {
-            jsonString = jsonString
-              .replace(/^```\n?/, "")
-              .replace(/\n?```$/, "");
-          }
-
-          const result: GeminiAnalysisResult = JSON.parse(jsonString);
-
-          // Validate required fields
-          if (
-            !result.food_name ||
-            !result.estimated_calories ||
-            result.protein_g === undefined ||
-            result.carbs_g === undefined ||
-            result.fat_g === undefined
-          ) {
-            throw new Error(
-              "Invalid response format - missing required nutrition data",
-            );
-          }
-
-          setGeminiResult(result);
-        } catch (parseErr: any) {
-          console.error("Parse error:", parseErr);
-          setGeminiError(
-            parseErr?.message || "Failed to parse nutrition data from image",
-          );
-          setAnalyzeImage(false);
+        } catch {
+          /* skip partial / malformed SSE frames */
         }
-      };
+      }
+    };
 
-      reader.onerror = () => {
-        setGeminiError("Failed to read image file");
-        setAnalyzeImage(false);
-      };
-
-      reader.readAsDataURL(blob);
-    } catch (err: any) {
-      console.error("Analysis error:", err);
-      setGeminiError(
-        err?.message || "Failed to analyze image. Please try again.",
-      );
+    xhr.onload = () => {
       setAnalyzeImage(false);
-    }
+      setStreamingText("");
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        setNvidiaError(
+          `NVIDIA API error ${xhr.status}: ${xhr.responseText.slice(0, 200)}`,
+        );
+        return;
+      }
+
+      try {
+        // Strip any markdown fences the model may have added
+        let jsonStr = fullContent
+          .trim()
+          .replace(/^```json\s*/i, "")
+          .replace(/^```\s*/, "")
+          .replace(/\s*```$/, "");
+
+        const match = jsonStr.match(/\{[\s\S]*\}/);
+        if (match) jsonStr = match[0];
+
+        const result: NvidiaAnalysisResult = JSON.parse(jsonStr);
+
+        if (
+          !result.food_name ||
+          result.estimated_calories === undefined ||
+          result.protein_g === undefined ||
+          result.carbs_g === undefined ||
+          result.fat_g === undefined
+        ) {
+          setNvidiaError(
+            "Response missing required nutrition fields. Please try again.",
+          );
+          return;
+        }
+
+        setNvidiaResult(result);
+      } catch (parseErr: any) {
+        console.error("Parse error:", parseErr, "\nRaw content:", fullContent);
+        setNvidiaError(
+          "Could not parse nutrition data from response. Please try again.",
+        );
+      }
+    };
+
+    xhr.onerror = () => {
+      setAnalyzeImage(false);
+      setStreamingText("");
+      setNvidiaError("Network error — check your connection and try again.");
+    };
+
+    xhr.ontimeout = () => {
+      setAnalyzeImage(false);
+      setStreamingText("");
+      setNvidiaError("Request timed out. Please try again.");
+    };
+
+    xhr.timeout = 60_000; // 60 s
+    xhr.send(body);
   };
 
-  // ─── Add Gemini result to log ────────────────────────────────────────
-  const addGeminiResultToLog = async (): Promise<void> => {
-    if (!geminiResult || !activeMeal) return;
-
+  // ─── Save NVIDIA result ───────────────────────────────────────────────
+  const addNvidiaResultToLog = async (): Promise<void> => {
+    if (!nvidiaResult || !activeMeal) return;
     setSaving(true);
     try {
       const {
         data: { user },
       } = await supabase.auth.getUser();
-
       if (!user) {
-        Alert.alert("Error", "User not authenticated");
+        Alert.alert("Error", "Not authenticated");
         setSaving(false);
         return;
       }
-
       const { error } = await supabase.from("food_logs").insert({
         user_id: user.id,
         meal_type: activeMeal,
-        food_name: geminiResult.food_name,
-        calories: geminiResult.estimated_calories,
-        protein_g: geminiResult.protein_g,
-        carbs_g: geminiResult.carbs_g,
-        fat_g: geminiResult.fat_g,
+        food_name: nvidiaResult.food_name,
+        calories: nvidiaResult.estimated_calories,
+        protein_g: nvidiaResult.protein_g,
+        carbs_g: nvidiaResult.carbs_g,
+        fat_g: nvidiaResult.fat_g,
         fiber_g: 0,
         serving_size: "1 serving (from image)",
         log_date: TODAY,
       });
-
-      if (error) {
-        Alert.alert("Error", `Failed to save: ${error.message}`);
-        console.error("Database error:", error);
-      } else {
+      if (error) Alert.alert("Error", `Failed to save: ${error.message}`);
+      else {
         await fetchLogs();
-        setModalVisible(false);
-        setSelectedImage(null);
-        setGeminiResult(null);
-        setTab("quick");
-        Alert.alert("Success", "Food logged successfully!");
+        closeImageModal();
+        Alert.alert("Success", "Food logged!");
       }
-    } catch (err: any) {
-      console.error("Save error:", err);
+    } catch {
       Alert.alert("Error", "Failed to save food log");
     } finally {
       setSaving(false);
     }
   };
 
-  // ─── Nutritionix natural language lookup ─────────────────────────────
+  // ─── Nutritionix text lookup ──────────────────────────────────────────
   const analyzeFoodByText = async (): Promise<void> => {
     if (!foodQuery.trim()) {
-      setAiError("Please describe what you ate (e.g. '2 rotis and dal').");
+      setAiError("Please describe what you ate.");
       return;
     }
-
-    if (!NUTRITIONIX_APP_ID || NUTRITIONIX_APP_ID.includes("YOUR_")) {
-      setAiError(
-        "Nutritionix API not configured. Text search is optional. Use image analysis instead.",
-      );
+    if (NUTRITIONIX_APP_ID.includes("YOUR_")) {
+      setAiError("Nutritionix API not configured. Use image analysis instead.");
       return;
     }
-
     setAnalyzing(true);
     setAiError(null);
-
     try {
       const response = await fetch(
         "https://trackapi.nutritionix.com/v2/natural/nutrients",
@@ -499,53 +512,38 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
           body: JSON.stringify({ query: foodQuery }),
         },
       );
-
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.message || "Could not find nutrition data.");
-      }
-
-      const foods: any[] = data.foods || [];
-      if (foods.length === 0) {
+      if (!response.ok)
+        throw new Error(data.message ?? "Could not find nutrition data.");
+      const foods: any[] = data.foods ?? [];
+      if (!foods.length)
         throw new Error("No food found. Try describing it differently.");
-      }
-
       const items = foods.map((f) => ({
         name: f.food_name,
         portion: `${f.serving_qty} ${f.serving_unit}`,
         calories: Math.round(f.nf_calories),
       }));
-
       const total_calories = items.reduce((s, i) => s + i.calories, 0);
-      const protein_g =
-        Math.round(foods.reduce((s, f) => s + (f.nf_protein || 0), 0) * 10) /
-        10;
-      const carbs_g =
-        Math.round(
-          foods.reduce((s, f) => s + (f.nf_total_carbohydrate || 0), 0) * 10,
-        ) / 10;
-      const fat_g =
-        Math.round(foods.reduce((s, f) => s + (f.nf_total_fat || 0), 0) * 10) /
-        10;
-
       setAiResult({
         total_calories,
-        calorie_range: `${Math.round(total_calories * 0.9)}–${Math.round(
-          total_calories * 1.1,
-        )}`,
+        calorie_range: `${Math.round(total_calories * 0.9)}-${Math.round(total_calories * 1.1)}`,
         confidence: 92,
-        protein_g,
-        carbs_g,
-        fat_g,
+        protein_g:
+          Math.round(foods.reduce((s, f) => s + (f.nf_protein || 0), 0) * 10) /
+          10,
+        carbs_g:
+          Math.round(
+            foods.reduce((s, f) => s + (f.nf_total_carbohydrate || 0), 0) * 10,
+          ) / 10,
+        fat_g:
+          Math.round(
+            foods.reduce((s, f) => s + (f.nf_total_fat || 0), 0) * 10,
+          ) / 10,
         items,
         notes: "Data from Nutritionix database.",
       });
     } catch (err: any) {
-      console.error("Nutritionix error:", err);
-      setAiError(
-        err?.message || "Could not fetch nutrition data. Please try again.",
-      );
+      setAiError(err?.message ?? "Could not fetch nutrition data.");
     } finally {
       setAnalyzing(false);
     }
@@ -562,7 +560,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
         setSaving(false);
         return;
       }
-
       for (const item of aiResult.items) {
         const ratio =
           aiResult.total_calories > 0
@@ -585,15 +582,13 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
           break;
         }
       }
-
       await fetchLogs();
       setAiModalVisible(false);
       setFoodQuery("");
       setAiResult(null);
-      setSaving(false);
-    } catch (err: any) {
-      console.error("Error:", err);
+    } catch {
       Alert.alert("Error", "Failed to save food log");
+    } finally {
       setSaving(false);
     }
   };
@@ -625,7 +620,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
         setModalVisible(false);
         Alert.alert("Success", `${food.name} added!`);
       } else Alert.alert("Error", error.message);
-    } catch (err: any) {
+    } catch {
       Alert.alert("Error", "Failed to add food");
     } finally {
       setSaving(false);
@@ -664,7 +659,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
         resetForm();
         Alert.alert("Success", `${foodName} added!`);
       } else Alert.alert("Error", error.message);
-    } catch (err: any) {
+    } catch {
       Alert.alert("Error", "Failed to add food");
     } finally {
       setSaving(false);
@@ -675,7 +670,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
     try {
       await supabase.from("food_logs").delete().eq("id", id);
       fetchLogs();
-    } catch (err: any) {
+    } catch {
       Alert.alert("Error", "Failed to delete entry");
     }
   };
@@ -711,7 +706,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
             })}
           </Text>
 
-          {/* Summary Card */}
           <LinearGradient
             colors={[COLORS.primary, "#FF8FAB"]}
             style={styles.summaryCard}
@@ -770,7 +764,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
             </View>
           </LinearGradient>
 
-          {/* Meal Cards */}
           {MEALS.map((meal) => {
             const mealLogs = logs.filter((l) => l.meal_type === meal.key);
             const mealCal = mealLogs.reduce((s, f) => s + f.calories, 0);
@@ -805,8 +798,8 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                         setActiveMeal(meal.key);
                         setTab("image");
                         setSelectedImage(null);
-                        setGeminiResult(null);
-                        setGeminiError(null);
+                        setNvidiaResult(null);
+                        setNvidiaError(null);
                         setModalVisible(true);
                       }}
                     >
@@ -861,7 +854,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
           <View style={{ height: 90 }} />
         </ScrollView>
 
-        {/* ─── Main Modal (Quick Add, Custom, Image) ──────────────────── */}
+        {/* ══════════ Main Modal ══════════ */}
         <Modal
           visible={modalVisible}
           animationType="slide"
@@ -877,7 +870,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                   <View style={styles.modalTitleContainer}>
                     <Ionicons
                       name={
-                        MEALS.find((m) => m.key === activeMeal)?.iconName ||
+                        MEALS.find((m) => m.key === activeMeal)?.iconName ??
                         "restaurant-outline"
                       }
                       size={24}
@@ -888,17 +881,11 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                       {activeMeal.charAt(0).toUpperCase() + activeMeal.slice(1)}
                     </Text>
                   </View>
-                  <TouchableOpacity
-                    onPress={() => {
-                      setModalVisible(false);
-                      setSelectedImage(null);
-                      setGeminiResult(null);
-                      setTab("quick");
-                    }}
-                  >
+                  <TouchableOpacity onPress={closeImageModal}>
                     <Ionicons name="close" size={24} color={COLORS.textMid} />
                   </TouchableOpacity>
                 </View>
+
                 <View style={styles.tabSwitch}>
                   {(["quick", "custom", "image"] as TabType[]).map((t) => (
                     <TouchableOpacity
@@ -921,10 +908,12 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                     </TouchableOpacity>
                   ))}
                 </View>
+
                 <ScrollView
                   contentContainerStyle={styles.modalScroll}
                   keyboardShouldPersistTaps="handled"
                 >
+                  {/* Quick Add */}
                   {tab === "quick" && (
                     <>
                       <View style={styles.searchBar}>
@@ -971,6 +960,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                     </>
                   )}
 
+                  {/* Custom */}
                   {tab === "custom" && (
                     <View style={styles.customForm}>
                       <ModalInput
@@ -1047,6 +1037,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                     </View>
                   )}
 
+                  {/* Photo / NVIDIA */}
                   {tab === "image" && (
                     <View style={styles.imageTab}>
                       {!selectedImage ? (
@@ -1060,9 +1051,19 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                             Analyze Food Photo
                           </Text>
                           <Text style={styles.imageSubtitle}>
-                            Take or upload a photo of your meal
+                            Take or upload a photo — AI will estimate calories
+                            and macros
                           </Text>
-
+                          <View style={styles.poweredBadge}>
+                            <Ionicons
+                              name="flash"
+                              size={12}
+                              color={COLORS.primary}
+                            />
+                            <Text style={styles.poweredText}>
+                              Powered by NVIDIA · Mistral Medium
+                            </Text>
+                          </View>
                           <View style={styles.imageActions}>
                             <TouchableOpacity
                               style={styles.imageActionBtn}
@@ -1077,7 +1078,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                                 Take Photo
                               </Text>
                             </TouchableOpacity>
-
                             <TouchableOpacity
                               style={styles.imageActionBtn}
                               onPress={pickImage}
@@ -1099,12 +1099,15 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                             source={{ uri: selectedImage }}
                             style={styles.selectedImage}
                           />
+
                           <TouchableOpacity
                             style={styles.changeImageBtn}
                             onPress={() => {
                               setSelectedImage(null);
-                              setGeminiResult(null);
-                              setGeminiError(null);
+                              setNvidiaResult(null);
+                              setNvidiaError(null);
+                              setStreamingText("");
+                              _pickedBase64 = "";
                             }}
                           >
                             <Text style={styles.changeImageText}>
@@ -1112,14 +1115,32 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                             </Text>
                           </TouchableOpacity>
 
-                          {!geminiResult && !geminiError && (
+                          {/* Streaming indicator */}
+                          {analyzeImage && (
+                            <View style={styles.streamingCard}>
+                              <ActivityIndicator
+                                size="small"
+                                color={COLORS.primary}
+                              />
+                              <Text style={styles.streamingLabel}>
+                                Analyzing with NVIDIA Mistral…
+                              </Text>
+                              {streamingText.length > 0 && (
+                                <Text
+                                  style={styles.streamingPreview}
+                                  numberOfLines={4}
+                                >
+                                  {streamingText}
+                                </Text>
+                              )}
+                            </View>
+                          )}
+
+                          {/* Analyze button */}
+                          {!nvidiaResult && !nvidiaError && !analyzeImage && (
                             <TouchableOpacity
-                              style={[
-                                styles.analyzeBtn,
-                                analyzeImage && { opacity: 0.6 },
-                              ]}
+                              style={styles.analyzeBtn}
                               onPress={analyzeFoodImage}
-                              disabled={analyzeImage}
                             >
                               <LinearGradient
                                 colors={[COLORS.primary, "#FF8FAB"]}
@@ -1127,26 +1148,30 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                                 end={{ x: 1, y: 0 }}
                                 style={styles.analyzeBtnGrad}
                               >
-                                {analyzeImage ? (
-                                  <ActivityIndicator color={COLORS.white} />
-                                ) : (
-                                  <Text style={styles.analyzeBtnText}>
-                                    Analyze with AI
-                                  </Text>
-                                )}
+                                <Ionicons
+                                  name="flash"
+                                  size={18}
+                                  color={COLORS.white}
+                                  style={{ marginRight: 6 }}
+                                />
+                                <Text style={styles.analyzeBtnText}>
+                                  Analyze with NVIDIA AI
+                                </Text>
                               </LinearGradient>
                             </TouchableOpacity>
                           )}
 
-                          {geminiError && (
+                          {/* Error */}
+                          {nvidiaError && (
                             <View style={styles.errorCard}>
                               <Text style={styles.errorTitle}>
-                                ⚠ {geminiError}
+                                {nvidiaError}
                               </Text>
                               <TouchableOpacity
                                 onPress={() => {
-                                  setGeminiError(null);
+                                  setNvidiaError(null);
                                   setSelectedImage(null);
+                                  _pickedBase64 = "";
                                 }}
                                 style={styles.errorBtn}
                               >
@@ -1157,11 +1182,13 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                             </View>
                           )}
 
-                          {geminiResult && (
-                            <View style={styles.geminiResultCard}>
+                          {/* Result */}
+                          {nvidiaResult && (
+                            <View style={styles.resultCard}>
                               <Text style={styles.resultFoodName}>
-                                {geminiResult.food_name}
+                                {nvidiaResult.food_name}
                               </Text>
+
                               <LinearGradient
                                 colors={[COLORS.primary, "#FF8FAB"]}
                                 style={styles.resultCalories}
@@ -1170,25 +1197,26 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                                   Estimated Calories
                                 </Text>
                                 <Text style={styles.resultCalValue}>
-                                  {geminiResult.estimated_calories}
+                                  {nvidiaResult.estimated_calories}
                                 </Text>
+                                <Text style={styles.resultCalUnit}>kcal</Text>
                               </LinearGradient>
 
                               <View style={styles.resultMacros}>
                                 {[
                                   {
                                     label: "Protein",
-                                    value: geminiResult.protein_g,
+                                    value: nvidiaResult.protein_g,
                                     icon: "food-steak" as const,
                                   },
                                   {
                                     label: "Carbs",
-                                    value: geminiResult.carbs_g,
+                                    value: nvidiaResult.carbs_g,
                                     icon: "bread-slice" as const,
                                   },
                                   {
                                     label: "Fat",
-                                    value: geminiResult.fat_g,
+                                    value: nvidiaResult.fat_g,
                                     icon: "oil" as const,
                                   },
                                 ].map((m) => (
@@ -1211,16 +1239,70 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                                 ))}
                               </View>
 
-                              <Text style={styles.confidenceLabel}>
-                                Confidence:{" "}
-                                <Text style={styles.confidenceValue}>
-                                  {geminiResult.confidence_level.toUpperCase()}
+                              {nvidiaResult.items?.length > 0 && (
+                                <View style={styles.itemsBox}>
+                                  <Text style={styles.itemsTitle}>
+                                    Identified Items
+                                  </Text>
+                                  {nvidiaResult.items.map((item, i) => (
+                                    <View
+                                      key={i}
+                                      style={[
+                                        styles.itemRow,
+                                        i === nvidiaResult.items.length - 1 && {
+                                          borderBottomWidth: 0,
+                                        },
+                                      ]}
+                                    >
+                                      <Text
+                                        style={[styles.itemName, { flex: 1 }]}
+                                      >
+                                        {item.name}
+                                      </Text>
+                                      <Text style={styles.itemCal}>
+                                        {item.estimated_calories} kcal
+                                      </Text>
+                                    </View>
+                                  ))}
+                                </View>
+                              )}
+
+                              <View style={styles.confidenceBadge}>
+                                <Ionicons
+                                  name={
+                                    nvidiaResult.confidence_level === "high"
+                                      ? "checkmark-circle"
+                                      : nvidiaResult.confidence_level ===
+                                          "medium"
+                                        ? "alert-circle"
+                                        : "help-circle"
+                                  }
+                                  size={14}
+                                  color={
+                                    nvidiaResult.confidence_level === "high"
+                                      ? "#22c55e"
+                                      : nvidiaResult.confidence_level ===
+                                          "medium"
+                                        ? "#f59e0b"
+                                        : "#ef4444"
+                                  }
+                                />
+                                <Text style={styles.confidenceLabel}>
+                                  Confidence:{" "}
+                                  <Text style={styles.confidenceValue}>
+                                    {nvidiaResult.confidence_level.toUpperCase()}
+                                  </Text>
                                 </Text>
+                              </View>
+
+                              <Text style={styles.disclaimer}>
+                                Values are AI estimates. Actual nutrition may
+                                vary by portion size.
                               </Text>
 
                               <TouchableOpacity
                                 style={styles.continueBtn}
-                                onPress={addGeminiResultToLog}
+                                onPress={addNvidiaResultToLog}
                                 disabled={saving}
                               >
                                 <LinearGradient
@@ -1231,7 +1313,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                                     <ActivityIndicator color={COLORS.white} />
                                   ) : (
                                     <Text style={styles.continueBtnText}>
-                                      Continue
+                                      Add to Log
                                     </Text>
                                   )}
                                 </LinearGradient>
@@ -1248,7 +1330,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
           </KeyboardAvoidingView>
         </Modal>
 
-        {/* ─── Nutritionix Search Modal ────────────────────────────────── */}
+        {/* ══════════ Nutritionix Modal ══════════ */}
         <Modal
           visible={aiModalVisible}
           animationType="slide"
@@ -1280,7 +1362,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                     <Ionicons name="close" size={24} color={COLORS.textMid} />
                   </TouchableOpacity>
                 </View>
-
                 <ScrollView
                   contentContainerStyle={styles.modalScroll}
                   keyboardShouldPersistTaps="handled"
@@ -1291,7 +1372,7 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                   <View style={styles.nutriSearchBox}>
                     <TextInput
                       style={styles.nutriSearchInput}
-                      placeholder='e.g. "2 rotis with dal" or "bowl of oats with milk"'
+                      placeholder='"2 rotis with dal" or "bowl of oats with milk"'
                       placeholderTextColor={COLORS.textLight}
                       value={foodQuery}
                       onChangeText={setFoodQuery}
@@ -1300,7 +1381,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                       onSubmitEditing={analyzeFoodByText}
                     />
                   </View>
-
                   <TouchableOpacity
                     style={[
                       styles.nutriSearchBtn,
@@ -1324,7 +1404,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                       )}
                     </LinearGradient>
                   </TouchableOpacity>
-
                   {!aiResult && !analyzing && (
                     <View style={styles.examplesSection}>
                       <Text style={styles.examplesTitle}>
@@ -1350,10 +1429,9 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                       </View>
                     </View>
                   )}
-
                   {aiError && (
                     <View style={styles.errorCard}>
-                      <Text style={styles.errorTitle}>⚠ {aiError}</Text>
+                      <Text style={styles.errorTitle}>{aiError}</Text>
                       <TouchableOpacity
                         onPress={() => setAiError(null)}
                         style={styles.errorBtn}
@@ -1362,7 +1440,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                       </TouchableOpacity>
                     </View>
                   )}
-
                   {aiResult && (
                     <View style={styles.resultsSection}>
                       <LinearGradient
@@ -1379,7 +1456,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                           kcal · range {aiResult.calorie_range}
                         </Text>
                       </LinearGradient>
-
                       <View style={styles.macrosRow}>
                         {[
                           {
@@ -1414,7 +1490,6 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                           </View>
                         ))}
                       </View>
-
                       <Text style={styles.itemsTitle}>Identified Items</Text>
                       <View style={styles.itemsList}>
                         {aiResult.items.map((item, i) => (
@@ -1439,18 +1514,15 @@ Be specific about portion sizes. If you cannot identify the food, set confidence
                           </View>
                         ))}
                       </View>
-
                       {aiResult.notes ? (
                         <View style={styles.notesCard}>
                           <Text style={styles.notesText}>{aiResult.notes}</Text>
                         </View>
                       ) : null}
-
                       <Text style={styles.disclaimer}>
                         Values are estimates. Actual nutrition may vary by
                         portion size.
                       </Text>
-
                       <View style={styles.actionRow}>
                         <TouchableOpacity
                           style={styles.retryBtn}
@@ -1524,11 +1596,7 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     marginBottom: 2,
   },
-  heading: {
-    fontSize: 26,
-    fontWeight: "800",
-    color: COLORS.textDark,
-  },
+  heading: { fontSize: 26, fontWeight: "800", color: COLORS.textDark },
   subheading: { fontSize: 13, color: COLORS.textLight, marginBottom: 16 },
   summaryCard: {
     borderRadius: RADIUS.xl,
@@ -1625,11 +1693,7 @@ const styles = StyleSheet.create({
     paddingTop: 16,
     paddingBottom: 8,
   },
-  modalTitleContainer: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
+  modalTitleContainer: { flexDirection: "row", alignItems: "center", gap: 8 },
   modalTitle: { fontSize: 18, fontWeight: "700", color: COLORS.textDark },
   tabSwitch: {
     flexDirection: "row",
@@ -1693,10 +1757,8 @@ const styles = StyleSheet.create({
   },
   saveBtnGrad: { paddingVertical: 16, alignItems: "center" },
   saveBtnText: { color: COLORS.white, fontSize: 16, fontWeight: "700" },
-
-  // Image tab styles
   imageTab: { gap: 16, paddingTop: 16 },
-  imagePicker: { alignItems: "center", gap: 24, paddingTop: 40 },
+  imagePicker: { alignItems: "center", gap: 20, paddingTop: 40 },
   imageTitle: {
     fontSize: 20,
     fontWeight: "700",
@@ -1709,6 +1771,16 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 20,
   },
+  poweredBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: COLORS.primary + "18",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: RADIUS.full,
+  },
+  poweredText: { fontSize: 11, color: COLORS.primary, fontWeight: "600" },
   imageActions: {
     width: "100%",
     flexDirection: "row",
@@ -1730,10 +1802,10 @@ const styles = StyleSheet.create({
     color: COLORS.textDark,
     textAlign: "center",
   },
-  imagePreview: { paddingHorizontal: 20 },
+  imagePreview: { paddingHorizontal: 4 },
   selectedImage: {
     width: "100%",
-    height: 300,
+    height: 260,
     borderRadius: RADIUS.lg,
     marginBottom: 16,
     ...SHADOW.card,
@@ -1745,10 +1817,22 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 12,
   },
-  changeImageText: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: COLORS.textMid,
+  changeImageText: { fontSize: 14, fontWeight: "600", color: COLORS.textMid },
+  streamingCard: {
+    backgroundColor: COLORS.white,
+    borderRadius: RADIUS.md,
+    padding: 16,
+    marginBottom: 12,
+    alignItems: "center",
+    gap: 8,
+    ...SHADOW.card,
+  },
+  streamingLabel: { fontSize: 14, fontWeight: "600", color: COLORS.textDark },
+  streamingPreview: {
+    fontSize: 11,
+    color: COLORS.textLight,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    textAlign: "center",
   },
   analyzeBtn: {
     borderRadius: RADIUS.full,
@@ -1756,14 +1840,20 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     ...SHADOW.soft,
   },
-  analyzeBtnGrad: { paddingVertical: 16, alignItems: "center" },
+  analyzeBtnGrad: {
+    paddingVertical: 16,
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "center",
+    paddingHorizontal: 24,
+  },
   analyzeBtnText: { color: COLORS.white, fontSize: 16, fontWeight: "700" },
-  geminiResultCard: { gap: 12, marginBottom: 20 },
+  resultCard: { gap: 12, marginBottom: 20 },
   resultFoodName: {
     fontSize: 18,
     fontWeight: "700",
     color: COLORS.textDark,
-    marginBottom: 8,
+    marginBottom: 4,
   },
   resultCalories: {
     borderRadius: RADIUS.lg,
@@ -1775,15 +1865,9 @@ const styles = StyleSheet.create({
     color: "rgba(255,255,255,0.8)",
     marginBottom: 4,
   },
-  resultCalValue: {
-    fontSize: 42,
-    fontWeight: "800",
-    color: COLORS.white,
-  },
-  resultMacros: {
-    flexDirection: "row",
-    gap: 10,
-  },
+  resultCalValue: { fontSize: 42, fontWeight: "800", color: COLORS.white },
+  resultCalUnit: { fontSize: 12, color: "rgba(255,255,255,0.8)", marginTop: 2 },
+  resultMacros: { flexDirection: "row", gap: 10 },
   resultMacroItem: {
     flex: 1,
     backgroundColor: COLORS.white,
@@ -1793,22 +1877,45 @@ const styles = StyleSheet.create({
     gap: 4,
     ...SHADOW.card,
   },
-  macroItemValue: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: COLORS.primary,
+  macroItemValue: { fontSize: 16, fontWeight: "700", color: COLORS.primary },
+  macroItemLabel: { fontSize: 11, color: COLORS.textLight, fontWeight: "600" },
+  itemsBox: {
+    backgroundColor: COLORS.white,
+    borderRadius: RADIUS.md,
+    overflow: "hidden",
+    ...SHADOW.card,
   },
-  macroItemLabel: {
+  itemsTitle: {
     fontSize: 11,
     color: COLORS.textLight,
     fontWeight: "600",
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 6,
   },
-  confidenceLabel: {
-    fontSize: 12,
-    color: COLORS.textMid,
-    marginBottom: 12,
+  itemRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.surface,
   },
+  itemName: { fontSize: 14, fontWeight: "600", color: COLORS.textDark },
+  itemPortion: { fontSize: 11, color: COLORS.textLight, marginTop: 2 },
+  itemCal: { fontSize: 13, fontWeight: "700", color: COLORS.primary },
+  confidenceBadge: { flexDirection: "row", alignItems: "center", gap: 6 },
+  confidenceLabel: { fontSize: 12, color: COLORS.textMid },
   confidenceValue: { fontWeight: "600", color: COLORS.primary },
+  disclaimer: {
+    fontSize: 10,
+    color: COLORS.textLight,
+    textAlign: "center",
+    lineHeight: 16,
+  },
   continueBtn: {
     borderRadius: RADIUS.full,
     overflow: "hidden",
@@ -1816,8 +1923,6 @@ const styles = StyleSheet.create({
   },
   continueBtnGrad: { paddingVertical: 16, alignItems: "center" },
   continueBtnText: { color: COLORS.white, fontSize: 16, fontWeight: "700" },
-
-  // Nutritionix modal
   searchHint: {
     fontSize: 14,
     color: COLORS.textMid,
@@ -1914,42 +2019,18 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
     letterSpacing: 0.5,
   },
-  itemsTitle: {
-    fontSize: 11,
-    color: COLORS.textLight,
-    fontWeight: "600",
-    textTransform: "uppercase",
-    letterSpacing: 1,
-  },
   itemsList: {
     backgroundColor: COLORS.white,
     borderRadius: RADIUS.md,
     overflow: "hidden",
     ...SHADOW.card,
   },
-  itemRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    padding: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.surface,
-  },
-  itemName: { fontSize: 14, fontWeight: "600", color: COLORS.textDark },
-  itemPortion: { fontSize: 11, color: COLORS.textLight, marginTop: 2 },
-  itemCal: { fontSize: 13, fontWeight: "700", color: COLORS.primary },
   notesCard: {
     backgroundColor: COLORS.primaryPale,
     borderRadius: RADIUS.md,
     padding: 14,
   },
   notesText: { fontSize: 12, color: COLORS.textMid, lineHeight: 18 },
-  disclaimer: {
-    fontSize: 10,
-    color: COLORS.textLight,
-    textAlign: "center",
-    lineHeight: 16,
-  },
   actionRow: { flexDirection: "row", gap: 12 },
   retryBtn: {
     flex: 1,
